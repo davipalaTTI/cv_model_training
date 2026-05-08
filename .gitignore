@@ -1,0 +1,39 @@
+# ========================
+# Python & Environments
+# ========================
+__pycache__/
+*.py[cod]
+*$py.class
+.venv/
+venv/
+env/
+
+# ========================
+# IDE Settings
+# ========================
+.idea/
+.vscode/
+
+# ========================
+# Project Specific: Do Not Push!
+# ========================
+# Ignore all heavy model weights...
+weights/*
+# ...BUT force Git to keep the folder structure by tracking the hidden file
+!weights/.gitkeep
+
+# Ignore all user data, inputs, and outputs
+input_raw/
+output/
+dataset/
+temp_extracted_frames/
+
+# Ignore log files
+*.log
+cv_data_engine.log
+
+# ========================
+# OS Generated
+# ========================
+.DS_Store
+Thumbs.db
