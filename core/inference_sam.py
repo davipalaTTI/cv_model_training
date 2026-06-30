@@ -15,21 +15,25 @@ class SAM3InferenceThread(QThread):
     finished = pyqtSignal(str)
     error_occurred = pyqtSignal(str)
 
+    # --- NEW: Added exclusion_coords to the initialization ---
     def __init__(self, model_path, input_path, output_paths, class_mapping,
-                 batch_size, device, conf_thresh, prompt_thresh, nms_thresh, output_format):
+                 batch_size, device, conf_thresh, prompt_thresh, nms_thresh, output_format,
+                 exclusion_coords=None):
         super().__init__()
         self.model_path = model_path
         self.input_path = input_path
         self.output_paths = output_paths
         self.class_mapping = class_mapping
 
-        # --- ALL PARAMS WIRED IN ---
-        self.batch_size = max(1, batch_size)  # Ensure it never drops below 1
+        self.batch_size = max(1, batch_size)
         self.device = device
         self.conf_thresh = conf_thresh
         self.prompt_thresh = prompt_thresh
         self.nms_thresh = nms_thresh
         self.output_format = output_format
+
+        # Save the GUI's polygon coordinates
+        self.exclusion_coords = exclusion_coords
 
         self._is_running = True
 
@@ -49,7 +53,6 @@ class SAM3InferenceThread(QThread):
                 logger.info(f"Loading weights from: {self.model_path}")
                 model = build_sam3_image_model(checkpoint_path=self.model_path).to(self.device)
 
-                # Passing your custom Thresholds into the Processor
                 processor = Sam3Processor(
                     model,
                     confidence_threshold=self.conf_thresh
@@ -69,7 +72,6 @@ class SAM3InferenceThread(QThread):
                 return
 
             # --- 3. BATCH CHUNKING LOGIC ---
-            # Breaking the total list into neat chunks based on the user's custom batch size.
             batches = [image_filepaths[i:i + self.batch_size]
                        for i in range(0, total_imgs, self.batch_size)]
 
@@ -90,7 +92,6 @@ class SAM3InferenceThread(QThread):
                         img_name = os.path.basename(img_path)
                         self.status_updated.emit(f"Annotating: {img_name} (Batch {batch_idx + 1}/{len(batches)})")
 
-                        # 80/20 Train/Valid Split
                         is_valid = (processed_count % 5 == 0)
                         target_img_dir = self.output_paths['val_img'] if is_valid else self.output_paths['train_img']
                         target_lbl_dir = self.output_paths['val_lbl'] if is_valid else self.output_paths['train_lbl']
@@ -100,6 +101,19 @@ class SAM3InferenceThread(QThread):
 
                         w, h = pil_image.size
                         label_lines = []
+
+                        # ==========================================
+                        # MASK GENERATION: Build the exclusion canvas
+                        # ==========================================
+                        exclusion_mask = None
+                        if self.exclusion_coords:  # Now this is a list of multiple zones
+                            exclusion_mask = np.zeros((h, w), dtype=np.uint8)
+
+                            # Convert multiple zones into a list of NumPy integer arrays
+                            pts_list = [np.array(zone, dtype=np.int32) for zone in self.exclusion_coords]
+
+                            # fillPoly inherently accepts a LIST of polygons and draws all of them!
+                            cv2.fillPoly(exclusion_mask, pts_list, 1)
 
                         # --- THE MAGIC FORWARD PASS ---
                         with torch.autocast(device_type="cuda", dtype=torch.bfloat16):
@@ -115,7 +129,21 @@ class SAM3InferenceThread(QThread):
 
                                     if masks is not None and len(masks) > 0:
                                         masks_np = masks.cpu().numpy()
+
                                         for mask in masks_np:
+                                            # Ensure mask is 2D
+                                            if mask.ndim == 3:
+                                                mask = mask[0]
+
+                                            # ==========================================
+                                            # EXCLUSION CHECK: Discard overlapping items
+                                            # ==========================================
+                                            if exclusion_mask is not None:
+                                                overlap = cv2.bitwise_and(mask.astype(np.uint8), exclusion_mask)
+                                                if np.any(overlap):
+                                                    continue  # Skip to the next mask!
+
+                                            # If it survived, format and save it
                                             yolo_line = self.convert_to_yolo(mask, class_id, w, h)
                                             if yolo_line:
                                                 label_lines.append(yolo_line)
@@ -131,10 +159,10 @@ class SAM3InferenceThread(QThread):
 
                     except Exception as e:
                         logger.error(f"Error processing {img_name}: {e}")
-                        processed_count += 1  # Ensure progress bar keeps moving even if one image corrupts
+                        processed_count += 1
                         continue
 
-                        # --- 5. SUCCESS ---
+            # --- 5. SUCCESS ---
             self.progress_updated.emit(100)
             self.finished.emit(f"Successfully auto-annotated {total_imgs} images/frames into YOLO format.")
 
@@ -146,18 +174,32 @@ class SAM3InferenceThread(QThread):
     # INPUT PARSING HELPERS
     # ==========================================
     def _gather_inputs(self, path_string):
+        """Determines if input is a folder, single file, or list of files and extracts accordingly."""
         inputs = []
         for path in path_string.split(";"):
             path = path.strip()
+
+            # If the user selected a Folder
             if os.path.isdir(path):
-                valid_exts = ('.jpg', '.jpeg', '.png', '.bmp', '.webp')
-                inputs.extend([os.path.join(path, f) for f in os.listdir(path) if f.lower().endswith(valid_exts)])
+                for f in os.listdir(path):
+                    full_path = os.path.join(path, f)
+                    ext = os.path.splitext(f)[1].lower()
+
+                    # Check for images
+                    if ext in ['.jpg', '.jpeg', '.png', '.bmp', '.webp']:
+                        inputs.append(full_path)
+                    # Check for videos
+                    elif ext in ['.mp4', '.avi', '.mov', '.mkv']:
+                        inputs.extend(self._extract_video_frames(full_path))
+
+            # If the user selected specific Files
             elif os.path.isfile(path):
                 ext = os.path.splitext(path)[1].lower()
                 if ext in ['.jpg', '.jpeg', '.png', '.bmp', '.webp']:
                     inputs.append(path)
                 elif ext in ['.mp4', '.avi', '.mov', '.mkv']:
                     inputs.extend(self._extract_video_frames(path))
+
         return inputs
 
     def _extract_video_frames(self, video_path):

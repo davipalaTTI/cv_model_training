@@ -1,9 +1,4 @@
 import os
-import requests
-from PyQt6.QtCore import QThread, pyqtSignal
-
-import os
-import requests
 import logging
 from PyQt6.QtCore import QThread, pyqtSignal
 
@@ -13,7 +8,7 @@ logger = logging.getLogger(__name__)
 class ModelDownloaderThread(QThread):
     """
     Refactored into a Model Validator.
-    Checks if the required SAM 3.1 weights exist locally.
+    Checks if the required SAM 3.1 weights AND the CLIP vocab exist locally.
     """
     progress_updated = pyqtSignal(int)
     status_updated = pyqtSignal(str)
@@ -24,46 +19,51 @@ class ModelDownloaderThread(QThread):
         super().__init__()
         self.model_type = model_type
 
-        # We only need the filenames now, not the URLs
+        # --- UPDATED REGISTRY: Now expects a LIST of required files ---
         self.model_registry = {
-            "SAM 3.1 Multiplex (Standard)": "sam3.1_multiplex.pt"
+            "SAM 3.1 Multiplex (Standard)": [
+                "sam3.1_multiplex.pt",
+                "bpe_simple_vocab_16e6.txt.gz"
+            ]
         }
 
     def run(self):
         try:
-            filename = self.model_registry.get(self.model_type)
+            # Grab the list of files needed for the selected model
+            required_files = self.model_registry.get(self.model_type, [])
 
             # --- THE BULLETPROOF PATH FIX ---
-            # 1. Get the exact path to this model_manager.py file (.../core/)
             core_dir = os.path.dirname(os.path.abspath(__file__))
-
-            # 2. Go up one level to the project root (.../cv_model_training/)
             project_root = os.path.dirname(core_dir)
-
-            # 3. Explicitly lock onto the weights folder
             weights_dir = os.path.join(project_root, "weights")
             os.makedirs(weights_dir, exist_ok=True)
 
-            filepath = os.path.join(weights_dir, filename)
+            self.status_updated.emit("Validating model assets...")
 
-            self.status_updated.emit("Validating weights...")
-            logger.info(f"Looking for weights at absolute path: {filepath}")
+            # --- VALIDATION LOOP ---
+            for filename in required_files:
+                filepath = os.path.join(weights_dir, filename)
+                logger.info(f"Looking for asset at absolute path: {filepath}")
 
-            # --- VALIDATION CHECK ---
-            if os.path.exists(filepath):
-                logger.info(f"Local weights validated: {filepath}")
-                self.progress_updated.emit(100)
+                if not os.path.exists(filepath):
+                    error_msg = (
+                        f"Missing Required Model Asset: {filename}\n\n"
+                        f"I looked exactly here:\n{filepath}\n\n"
+                        f"Please ensure it is placed in the 'weights/' folder."
+                    )
+                    logger.error(f"Validation failed: {filepath} not found.")
+                    self.error_occurred.emit(error_msg)
+                    return  # Stop the thread immediately if ANY file is missing
 
-                # We send the ABSOLUTE path to the inference engine so it doesn't get lost either!
-                self.download_complete.emit(filepath)
-            else:
-                error_msg = (
-                    f"Missing Model Weights: {filename}\n\n"
-                    f"I looked exactly here:\n{filepath}\n\n"
-                    f"Please ensure it is placed there and named correctly."
-                )
-                logger.error(f"Validation failed: {filepath} not found.")
-                self.error_occurred.emit(error_msg)
+            # --- SUCCESS ---
+            # If the loop finishes without returning, all files exist!
+            logger.info("All local model assets validated successfully.")
+            self.progress_updated.emit(100)
+
+            # We send the ABSOLUTE path of the MAIN .pt file to the inference engine
+            # (SAM 3 will automatically find the vocab file sitting next to it)
+            main_filepath = os.path.join(weights_dir, required_files[0])
+            self.download_complete.emit(main_filepath)
 
         except Exception as e:
             logger.error(f"Validator failed: {e}")

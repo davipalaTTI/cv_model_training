@@ -1,6 +1,7 @@
 import sys
 import logging
 import os
+import cv2  # <-- NEW: Needed to grab the first frame for the drawer
 from PyQt6.QtWidgets import (QApplication, QMainWindow, QWidget, QVBoxLayout,
                              QHBoxLayout, QGroupBox, QLabel, QComboBox,
                              QPushButton, QTableWidget, QTableWidgetItem,
@@ -11,11 +12,19 @@ from PyQt6.QtCore import Qt, QEvent
 from PyQt6.QtGui import QIntValidator
 from gui.viewer_widget import YOLOViewerWidget
 
+# --- NEW: Import the Polygon Drawer ---
+try:
+    from gui.polygon_drawer import PolygonDrawerDialog
+except ImportError:
+    print("WARNING: gui/polygon_drawer.py not found. Exclusion zone feature disabled.")
+
 # Import our custom background downloader/validator
 try:
     from core.model_manager import ModelDownloaderThread
 except ImportError:
     print("CRITICAL: core/model_manager.py not found. Pipeline will fail.")
+
+from gui.live_preview import LivePreviewDialog
 
 # ==========================================
 # 0. LOGGING CONFIGURATION
@@ -96,6 +105,9 @@ class DataEngineGUI(BaseAppWindow):
         try:
             self.deleted_rows_history = []
             self.current_output_paths = {}
+
+            # --- NEW: Store Exclusion Zone Coordinates ---
+            self.current_exclusion_zone = None
 
             # --- TABS SETUP ---
             self.tabs = QTabWidget()
@@ -275,11 +287,23 @@ class DataEngineGUI(BaseAppWindow):
             btn_files = QPushButton("Select File(s)")
             btn_files.clicked.connect(self.browse_input_files)
 
+            # --- Exclusion Zone Button ---
+            self.btn_draw_zone = QPushButton("Draw Exclusion Zone")
+            self.btn_draw_zone.clicked.connect(self.setup_exclusion_zone)
+            self.btn_draw_zone.setEnabled(False)  # Disabled until an input is selected
+
+            # --- Live Preview Button ---
+            self.btn_live_preview = QPushButton("Live Model Preview")
+            self.btn_live_preview.clicked.connect(self.launch_live_preview)
+            self.btn_live_preview.setEnabled(False)  # Disabled until input is selected
+
             row_in.addWidget(QLabel("Input Images:"))
             row_in.addWidget(self.input_path_display)
             row_in.addWidget(btn_folder)
             row_in.addWidget(btn_files)
-            layout.addLayout(row_in)
+            row_in.addWidget(self.btn_draw_zone)
+            row_in.addWidget(self.btn_live_preview)
+            layout.addLayout(row_in) # <-- Only doing this once now!
 
             row_out = QHBoxLayout()
             self.output_path_display = QLineEdit()
@@ -322,6 +346,150 @@ class DataEngineGUI(BaseAppWindow):
     # ==========================================
     # 3. INTERFACE LOGIC
     # ==========================================
+
+    def setup_exclusion_zone(self):
+        """Grabs the first frame and launches the polygon drawer."""
+        input_paths = self.input_path_display.text()
+        if not input_paths:
+            return
+
+        # Get the very first file from the input selection
+        first_file = input_paths.split(";")[0]
+
+        # If it's a folder, grab the first media file inside it
+        if os.path.isdir(first_file):
+            # --- FIXED: Added video extensions so it sees .mp4, .avi, etc. ---
+            valid_exts = ('.jpg', '.jpeg', '.png', '.bmp', '.webp', '.mp4', '.avi', '.mov', '.mkv')
+            files = [f for f in os.listdir(first_file) if f.lower().endswith(valid_exts)]
+            if not files:
+                QMessageBox.warning(self, "Error", "No valid media (images or video) found in the selected folder.")
+                return
+            first_file = os.path.join(first_file, files[0])
+
+        # Extract the first frame using OpenCV
+        cap = cv2.VideoCapture(first_file)
+        ret, frame = cap.read()
+        cap.release()
+
+        if ret:
+            temp_path = "temp_first_frame.jpg"
+            cv2.imwrite(temp_path, frame)
+
+            try:
+                # Launch the Dialog
+                dialog = PolygonDrawerDialog(temp_path, self)
+                if dialog.exec():
+                    self.current_exclusion_zone = dialog.final_zones
+                    self.btn_draw_zone.setStyleSheet(
+                        "background-color: #a6e3a1; color: #11111b;")  # Turn button green when active
+                    logger.info(f"Exclusion zone saved: {self.current_exclusion_zone}")
+                else:
+                    # User clicked cancel or closed window
+                    self.current_exclusion_zone = None
+                    self.btn_draw_zone.setStyleSheet("")  # Reset styling
+            except NameError:
+                QMessageBox.critical(self, "Error", "PolygonDrawerDialog module not loaded.")
+            finally:
+                # Clean up the temp file
+                if os.path.exists(temp_path):
+                    os.remove(temp_path)
+        else:
+            QMessageBox.warning(self, "Error", "Could not read the input file to generate a preview.")
+
+    def launch_live_preview(self):
+        """Gathers a few sample frames and opens the Real-Time Previewer."""
+        input_paths = self.input_path_display.text()
+        if not input_paths: return
+
+        # 1. Grab current settings from GUI
+        device = self.combo_device.currentText()
+        conf_thresh = self.slider_conf.value() / 100.0
+
+        class_list = []
+        for row in range(self.table.rowCount()):
+            item = self.table.item(row, 1)
+            if item and item.text().strip():
+                class_list.append(item.text().strip())
+
+        if not class_list:
+            QMessageBox.warning(self, "Missing Data", "Please add at least one class keyword to test!")
+            return
+
+        # 2. Extract a few sample frames to scrub through
+        first_file = input_paths.split(";")[0]
+        test_frames = []
+        target_media = first_file
+
+        # If a folder was selected, find the very first valid media file inside it
+        if os.path.isdir(first_file):
+            valid_exts = ('.jpg', '.jpeg', '.png', '.bmp', '.webp', '.mp4', '.avi', '.mov', '.mkv')
+            files = [f for f in os.listdir(first_file) if f.lower().endswith(valid_exts)]
+            if not files:
+                QMessageBox.warning(self, "Error", "No valid media found in the selected folder.")
+                return
+            target_media = os.path.join(first_file, files[0])
+
+        # Check if the target media is an image or video
+        ext = os.path.splitext(target_media)[1].lower()
+        if ext in ['.mp4', '.avi', '.mov', '.mkv']:
+            # It's a video! Extract exactly 10 frames to test
+            cap = cv2.VideoCapture(target_media)
+            total_frames = int(cap.get(cv2.CAP_PROP_FRAME_COUNT))
+            temp_dir = "temp_preview_frames"
+            os.makedirs(temp_dir, exist_ok=True)
+
+            if total_frames > 0:
+                steps = max(1, total_frames // 10)
+                for i in range(0, total_frames, steps):
+                    cap.set(cv2.CAP_PROP_POS_FRAMES, i)
+                    ret, frame = cap.read()
+                    if ret:
+                        path = os.path.join(temp_dir, f"prev_{i}.jpg")
+                        cv2.imwrite(path, frame)
+                        test_frames.append(path)
+                    if len(test_frames) >= 10: break  # Safety cap
+            else:
+                # Fallback if OpenCV cannot read the video's total length
+                saved_count = 0
+                while cap.isOpened() and len(test_frames) < 10:
+                    ret, frame = cap.read()
+                    if not ret: break
+                    if saved_count % 30 == 0:  # Grab 1 frame every 30 frames
+                        path = os.path.join(temp_dir, f"prev_{saved_count}.jpg")
+                        cv2.imwrite(path, frame)
+                        test_frames.append(path)
+                    saved_count += 1
+            cap.release()
+
+        else:
+            # It's an image. If a folder was selected, grab up to 15 images.
+            if os.path.isdir(first_file):
+                img_exts = ('.jpg', '.jpeg', '.png', '.bmp', '.webp')
+                img_files = [os.path.join(first_file, f) for f in os.listdir(first_file) if
+                             f.lower().endswith(img_exts)]
+                test_frames = img_files[:15]
+            else:
+                test_frames = [target_media]
+
+        if not test_frames:
+            QMessageBox.warning(self, "Error", "Could not load test frames.")
+            return
+
+        # 3. We need the physical path to the model file to boot the thread
+        selected_model = self.combo_sam.currentText()
+        model_filename = "sam3.1_multiplex.pt"  # Standard name
+        core_dir = os.path.dirname(os.path.abspath(__file__))
+        weights_dir = os.path.join(os.path.dirname(core_dir), "weights")
+        model_path = os.path.join(weights_dir, model_filename)
+
+        if not os.path.exists(model_path):
+            QMessageBox.critical(self, "Error",
+                                 "Model weights not found. Please click Start once to trigger the downloader.")
+            return
+
+        # 4. Launch!
+        dialog = LivePreviewDialog(test_frames, model_path, device, conf_thresh, class_list, self)
+        dialog.exec()
 
     def start_annotation_pipeline(self):
         try:
@@ -393,7 +561,8 @@ class DataEngineGUI(BaseAppWindow):
             from core.inference_sam import SAM3InferenceThread
             self.inference_thread = SAM3InferenceThread(
                 model_filepath, input_folder, output_paths, class_list,
-                batch, device, conf, prompt, nms, out_format
+                batch, device, conf, prompt, nms, out_format,
+                self.current_exclusion_zone  # <-- NEW: Pass the coordinates!
             )
 
             self.inference_thread.status_updated.connect(lambda m: self.btn_start.setText(m))
@@ -456,12 +625,16 @@ class DataEngineGUI(BaseAppWindow):
         path = QFileDialog.getExistingDirectory(self, "Select Input Folder")
         if path:
             self.input_path_display.setText(path)
+            self.btn_draw_zone.setEnabled(True)     # Activate exclusion button
+            self.btn_live_preview.setEnabled(True)  # Activate preview button
 
     def browse_input_files(self):
         paths, _ = QFileDialog.getOpenFileNames(self, "Select Image(s) or Video", "",
                                                 "Media Files (*.jpg *.jpeg *.png *.mp4 *.avi)")
         if paths:
             self.input_path_display.setText(";".join(paths))
+            self.btn_draw_zone.setEnabled(True)     # Activate exclusion button
+            self.btn_live_preview.setEnabled(True)  # Activate preview button
 
     def browse_output(self):
         f = QFileDialog.getExistingDirectory(self, "Select Output Folder")
