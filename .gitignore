@@ -27,6 +27,7 @@ input_raw/
 output/
 dataset/
 temp_extracted_frames/
+temp_preview_frames/
 
 # Ignore log files
 *.log
